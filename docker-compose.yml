@@ -1,0 +1,18 @@
+services:
+  market-mcp:
+    build: .
+    image: market-mcp:latest
+    container_name: market-mcp
+    restart: unless-stopped
+    env_file: .env
+    # curl_cffi's c-ares resolver times out (~10 s per lookup) against some home-router DNS servers; public resolvers are instant
+    dns:
+      - 1.1.1.1
+      - 9.9.9.9
+    environment:
+      TZ: Europe/Rome
+    ports:
+      # LAN/VPN only: do not forward this port on the router. Every path except /healthz needs the bearer token.
+      - "8765:8765"
+    volumes:
+      - ./data:/data   # isins.json (your ISIN map), EODHD call counter, learned ISINs, SQLite cache

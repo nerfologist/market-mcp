@@ -1,0 +1,6 @@
+.env
+.git
+data/
+deploy.env
+PLAN-*.md
+__pycache__/
