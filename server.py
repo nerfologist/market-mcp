@@ -54,7 +54,13 @@ mcp = FastMCP(
         "official ECB reference rate (ecb_rate, ecb_rate_history, to_eur); for Italian tax figures use "
         "the Banca d'Italia rate (bdi_rate, or to_eur with source='bdi'), identical to ECB for major "
         "currencies; for an intraday conversion of a live price use fx (Yahoo spot, e.g. EURUSD) and "
-        "divide. Historical closes are split-adjusted; corporate_actions lists splits and dividends."
+        "divide. Historical closes are split-adjusted; corporate_actions lists splits and dividends. "
+        "EUR views: quote_eur/quotes_eur (spot for the price, previous ECB fix for the previous close, "
+        "so fx_contribution_pct is the FX part of the day move). portfolio() values the hand-maintained "
+        "holdings file (live, or at a past close with day=); checkpoint(day) stores a valuation, "
+        "checkpoints() lists them, dietz() computes Modified Dietz between two with the caller's flows; "
+        "dividends(symbol, year) converts payouts at the Banca d'Italia rate. The server holds no targets "
+        "or advice: it values what it is given."
     ),
 )
 
@@ -249,7 +255,9 @@ def _yahoo_closes(sym: str, start: date, end_incl: date) -> list[dict]:
     )
     if h.empty:
         raise ValueError(f"no data for {sym} from Yahoo")
-    return [{"date": i.date().isoformat(), "close": round(float(r["Close"]), 4)} for i, r in h.iterrows()]
+    # an in-progress or halted day can carry a NaN close; SQLite would store it as NULL
+    return [{"date": i.date().isoformat(), "close": round(float(r["Close"]), 4)}
+            for i, r in h.iterrows() if r["Close"] == r["Close"]]
 
 
 def _fetch_closes(sym: str, start: date, end_incl: date, source: Source) -> tuple[list[dict], str]:
@@ -462,6 +470,337 @@ def sources_status() -> dict:
         bdi_s = {"error": str(e)}
     return {"yahoo": {"yfinance": yf.__version__}, "eodhd": eodhd.usage(), "ecb_fx": ecb_s,
             "bdi_fx": bdi_s, "cache_db": db}
+
+
+# ----------------------------------------------------------------------------------------------
+# v2: EUR views, holdings valuation, checkpoints, Modified Dietz, dividends in EUR.
+# The server holds no opinions: no targets, no buy/sell logic. It values what holdings.json says.
+# ----------------------------------------------------------------------------------------------
+
+HOLDINGS_PATH = os.environ.get("HOLDINGS_PATH", "/config/holdings.json")
+HOLDINGS_MAX_AGE_DAYS = 7
+# checkpoint() writes to the cache DB; everything else stays READ_ONLY
+WRITES = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+
+
+def _pct(a: float | None, b: float | None) -> float | None:
+    return round((a / b - 1) * 100, 4) if a is not None and b else None
+
+
+def _fx_spot(ccy: str) -> tuple[float, str]:
+    """Yahoo spot: units of `ccy` per 1 EUR. EURHKD is not always quoted, so fall back to
+    EURUSD x USDHKD (and the same for any other currency)."""
+    ccy = ccy.upper()
+    if ccy == "EUR":
+        return 1.0, "none"
+    try:
+        q = _quote(f"EUR{ccy}=X")
+        if q["price"] and not q.get("stale"):
+            return float(q["price"]), f"EUR{ccy}"
+    except Exception:
+        q = None
+    try:
+        usd = _quote("EURUSD=X")
+        cross = _quote(f"USD{ccy}=X")
+        return float(usd["price"]) * float(cross["price"]), f"EURUSD*USD{ccy}"
+    except Exception as e:
+        if q:  # stale EURccy beats nothing
+            return float(q["price"]), f"EUR{ccy}(stale)"
+        raise ValueError(f"no spot rate for {ccy}: {e}")
+
+
+def _prev_fix(ccy: str, as_of: str) -> dict:
+    """ECB reference rate of the business day before `as_of` (YYYY-MM-DD): the fix the previous
+    close was last marked at, so the day's EUR move splits into price move + FX move."""
+    d = date.fromisoformat(as_of) - timedelta(days=1)
+    return ecb.rate(ccy, d.isoformat())
+
+
+def _quote_eur(sym: str) -> dict:
+    q = _quote(sym)
+    ccy = (q.get("currency") or "EUR").upper()
+    out = {**q}
+    if ccy == "EUR":
+        out.update(price_eur=q["price"], previous_close_eur=q.get("previous_close"), fx_rate_used=1.0,
+                   fx_pair_used="none", prev_fx_rate_used=1.0)
+    else:
+        spot, pair = _fx_spot(ccy)
+        prev_fix = _prev_fix(ccy, q["as_of_utc"][:10])
+        out.update(price_eur=round(q["price"] / spot, 4),
+                   previous_close_eur=round(q["previous_close"] / prev_fix["rate"], 4) if q.get("previous_close") else None,
+                   fx_rate_used=round(spot, 6), fx_pair_used=pair,
+                   prev_fx_rate_used=prev_fix["rate"], prev_fx_date=prev_fix["date"])
+    out["day_change_pct"] = _pct(q["price"], q.get("previous_close"))
+    out["day_change_eur_pct"] = _pct(out["price_eur"], out["previous_close_eur"])
+    if out["day_change_pct"] is not None and out["day_change_eur_pct"] is not None:
+        out["fx_contribution_pct"] = round(out["day_change_eur_pct"] - out["day_change_pct"], 4)
+    else:
+        out["fx_contribution_pct"] = None
+    return out
+
+
+@mcp.tool(annotations=READ_ONLY)
+def quote_eur(symbol: str) -> dict:
+    """quote() plus EUR fields: price_eur, previous_close_eur, day_change_pct (listing currency),
+    day_change_eur_pct, fx_rate_used, fx_contribution_pct = day_change_eur_pct - day_change_pct.
+    Convention: price_eur uses the live Yahoo spot (EURUSD, EURHKD or EURUSD x USDHKD when EURHKD is
+    missing); previous_close_eur uses the ECB reference rate of the business day before the quote's
+    as_of date, so the FX contribution is spot-vs-previous-fix, the same split DEGIRO's day P/L
+    implies. EUR listings: fx_rate_used 1, contribution 0."""
+    return _quote_eur(resolve(symbol))
+
+
+@mcp.tool(annotations=READ_ONLY)
+def quotes_eur(symbols: list[str]) -> list[dict]:
+    """quotes() with the EUR fields of quote_eur() on every item (same FX convention). Errors are
+    returned per item, not raised."""
+    res = []
+    for s in symbols:
+        try:
+            res.append({"input": s, **_quote_eur(resolve(s))})
+        except Exception as e:
+            res.append({"input": s, "error": str(e)})
+    return res
+
+
+@mcp.tool(annotations=READ_ONLY)
+def closes_on(symbols: list[str], day: str) -> list[dict]:
+    """close_on() for several tickers/ISINs on one date (YYYY-MM-DD, or the last trading day before
+    it). Errors are returned per item. For a counterfactual column: closes_on(sold_lines, day)."""
+    res = []
+    for s in symbols:
+        try:
+            res.append({"input": s, **close_on(s, day)})
+        except Exception as e:
+            res.append({"input": s, "error": str(e)})
+    return res
+
+
+def _load_holdings() -> dict:
+    try:
+        with open(HOLDINGS_PATH) as f:
+            h = json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"holdings file not found at {HOLDINGS_PATH}; see config/holdings.example.json")
+    for k in ("as_of", "positions"):
+        if k not in h:
+            raise ValueError(f"holdings file lacks '{k}'")
+    h.setdefault("cash_eur", 0.0)
+    h.setdefault("buckets", {})
+    return h
+
+
+def _currency(sym: str) -> str:
+    return (_quote(sym).get("currency") or "EUR").upper()
+
+
+def _value_on(sym: str, day: str) -> dict:
+    """Close on `day` (or the last trading day before) and the close before that, both in EUR at the
+    ECB reference rate of their own date."""
+    d = date.fromisoformat(day)
+    rows, src = _closes(sym, d - timedelta(days=21), d, "auto")
+    rows = [r for r in rows if r["date"] <= day]
+    if not rows:
+        raise ValueError(f"no close for {sym} up to {day}")
+    if rows[-1]["close"] != rows[-1]["close"]:
+        raise ValueError(f"close for {sym} on {rows[-1]['date']} is not a number")
+    ccy = _currency(sym)
+    last, prev = rows[-1], (rows[-2] if len(rows) > 1 else None)
+    fix = ecb.rate(ccy, last["date"])
+    out = {"symbol": sym, "currency": ccy, "price": last["close"], "price_date": last["date"],
+           "price_eur": round(last["close"] / fix["rate"], 4), "fx_rate_used": fix["rate"],
+           "fx_date": fix["date"], "fx_source": "ecb", "source": src}
+    if prev:
+        pfix = ecb.rate(ccy, prev["date"])
+        out.update(previous_close=prev["close"], previous_close_date=prev["date"],
+                   previous_close_eur=round(prev["close"] / pfix["rate"], 4), prev_fx_rate_used=pfix["rate"])
+    else:
+        out.update(previous_close=None, previous_close_eur=None)
+    return out
+
+
+def _value_holdings(h: dict, day: str | None) -> dict:
+    """Value every position of a holdings dict, live (quotes_eur) or at the close of `day`."""
+    bucket_of = {isin: b for b, isins in h["buckets"].items() for isin in isins}
+    positions, warnings = [], []
+    for p in h["positions"]:
+        isin, qty = p["isin"].strip().upper(), float(p["qty"])
+        row = {"isin": isin, "name": p.get("name"), "bucket": bucket_of.get(isin, "Unassigned"), "qty": qty,
+               "avg_cost_eur": p.get("avg_cost_eur")}
+        try:
+            sym = resolve(isin)
+            v = _value_on(sym, day) if day else _quote_eur(sym)
+            row.update(symbol=sym, currency=v.get("currency"), price=v["price"], price_eur=v["price_eur"],
+                       fx_rate_used=v["fx_rate_used"], value_eur=round(qty * v["price_eur"], 2))
+            if day:
+                row["price_date"] = v["price_date"]
+            else:
+                row["as_of_utc"] = v.get("as_of_utc")
+                if v.get("stale"):
+                    row["stale"] = True
+                    warnings.append(f"{sym}: stale quote ({v.get('stale_reason')})")
+            prev_eur = v.get("previous_close_eur")
+            if prev_eur:
+                row["day_change_eur"] = round(qty * (v["price_eur"] - prev_eur), 2)
+                row["day_change_pct"] = _pct(v["price"], v.get("previous_close"))
+                row["day_change_eur_pct"] = _pct(v["price_eur"], prev_eur)
+            else:
+                row["day_change_eur"] = None
+            if p.get("avg_cost_eur"):
+                row["unrealised_pl_eur"] = round(qty * (v["price_eur"] - float(p["avg_cost_eur"])), 2)
+                row["unrealised_pl_pct"] = _pct(v["price_eur"], float(p["avg_cost_eur"]))
+        except Exception as e:
+            row["error"] = str(e)
+            warnings.append(f"{isin}: {e}")
+        positions.append(row)
+    valued = [r for r in positions if "error" not in r]
+    cash = float(h.get("cash_eur") or 0.0)
+    total = round(sum(r["value_eur"] for r in valued) + cash, 2)
+    day_chg = round(sum(r["day_change_eur"] or 0.0 for r in valued), 2)
+    invested = sum(r["qty"] * float(r["avg_cost_eur"]) for r in valued if r.get("avg_cost_eur"))
+    for r in valued:
+        r["weight_pct"] = round(r["value_eur"] / total * 100, 2) if total else None
+    buckets = {}
+    for name in list(h["buckets"]) + (["Unassigned"] if any(r["bucket"] == "Unassigned" for r in valued) else []):
+        rows = [r for r in valued if r["bucket"] == name]
+        val = round(sum(r["value_eur"] for r in rows), 2)
+        buckets[name] = {"value_eur": val, "weight_pct": round(val / total * 100, 2) if total else None,
+                         "day_change_eur": round(sum(r["day_change_eur"] or 0.0 for r in rows), 2),
+                         "positions": [r["symbol"] for r in rows]}
+    if cash:
+        buckets["Cash"] = {"value_eur": round(cash, 2), "weight_pct": round(cash / total * 100, 2) if total else None,
+                           "day_change_eur": 0.0, "positions": []}
+    as_of = date.fromisoformat(h["as_of"])
+    age = (date.today() - as_of).days
+    if age > HOLDINGS_MAX_AGE_DAYS:
+        warnings.insert(0, f"holdings file as_of {h['as_of']} is {age} days old; update it from DEGIRO")
+    return {
+        "valuation": f"close {day}" if day else "live (about 15 min delayed)",
+        "holdings_as_of": h["as_of"], "holdings_age_days": age,
+        "totals": {"value_eur": total, "cash_eur": round(cash, 2), "invested_eur": round(invested, 2),
+                   "unrealised_pl_eur": round(total - cash - invested, 2) if invested else None,
+                   "day_change_eur": day_chg,
+                   "day_change_pct": round(day_chg / (total - day_chg) * 100, 4) if total - day_chg else None,
+                   "positions_valued": len(valued), "positions_failed": len(positions) - len(valued)},
+        "buckets": buckets, "positions": positions, "warnings": warnings,
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def portfolio(day: str | None = None) -> dict:
+    """Value the holdings file (maintained by hand from DEGIRO, never written by the server): per
+    position symbol, qty, price_eur, value_eur, weight_pct, unrealised_pl_eur/pct vs avg_cost_eur,
+    day_change_eur; per bucket value_eur, weight_pct, day_change_eur; totals incl. cash. Without
+    `day`: live prices via the quotes_eur convention (Yahoo spot, previous close at the previous ECB
+    fix). With `day` (YYYY-MM-DD): closes of that day converted at the ECB reference rate of the day.
+    Warns when the holdings file is older than 7 days. No targets or advice: it values what it is given."""
+    return _value_holdings(_load_holdings(), day)
+
+
+@mcp.tool(annotations=WRITES)
+def checkpoint(day: str, total_eur: float | None = None, note: str | None = None) -> dict:
+    """Store a portfolio valuation for `day` (YYYY-MM-DD) in SQLite, for checkpoints() and dietz().
+    Default: values the current holdings file at that day's closes (ECB rate of the day for USD/HKD)
+    and stores total and per-line values. Pass `total_eur` to store a known figure instead (e.g. a
+    DEGIRO export from before the holdings changed). Idempotent: re-running a day overwrites it."""
+    date.fromisoformat(day)
+    if total_eur is not None:
+        store.save_checkpoint(day, round(float(total_eur), 2), None, None, "manual", note, None)
+        return {"day": day, "total_eur": round(float(total_eur), 2), "source": "manual", "note": note, "stored": True}
+    h = _load_holdings()
+    v = _value_holdings(h, day)
+    if v["totals"]["positions_failed"]:
+        raise ValueError("not stored: some positions could not be valued: " + "; ".join(v["warnings"]))
+    detail = {"positions": [{k: r.get(k) for k in ("isin", "symbol", "qty", "price", "currency", "price_date",
+                                                   "fx_rate_used", "price_eur", "value_eur")} for r in v["positions"]],
+              "buckets": {b: x["value_eur"] for b, x in v["buckets"].items()}}
+    store.save_checkpoint(day, v["totals"]["value_eur"], v["totals"]["cash_eur"], h["as_of"], "valued", note, detail)
+    return {"day": day, "total_eur": v["totals"]["value_eur"], "cash_eur": v["totals"]["cash_eur"],
+            "holdings_as_of": h["as_of"], "source": "valued", "note": note, "stored": True,
+            "buckets": detail["buckets"], "positions": detail["positions"], "warnings": v["warnings"]}
+
+
+@mcp.tool(annotations=READ_ONLY)
+def checkpoints(day: str | None = None) -> list[dict] | dict:
+    """Stored checkpoints oldest-first (day, total_eur, cash_eur, holdings_as_of, source valued|manual,
+    note). Pass `day` to get one row with its per-line detail."""
+    if day:
+        r = store.get_checkpoint(day)
+        if not r:
+            raise ValueError(f"no checkpoint stored for {day}")
+        return r
+    return store.list_checkpoints()
+
+
+@mcp.tool(annotations=READ_ONLY)
+def dietz(start_day: str, end_day: str, flows: list[dict] | None = None) -> dict:
+    """Modified Dietz return between two stored checkpoints. flows: external cash flows in between,
+    [{"day": "YYYY-MM-DD", "amount_eur": 2000}], deposits positive, withdrawals negative (the caller
+    supplies them; holdings changes are not tracked). Each flow is weighted by the fraction of the
+    period remaining after its day. R = (V1 - V0 - F) / (V0 + sum(w_i * F_i))."""
+    v0, v1 = store.get_checkpoint(start_day), store.get_checkpoint(end_day)
+    if not v0 or not v1:
+        missing = [d for d, v in ((start_day, v0), (end_day, v1)) if not v]
+        raise ValueError(f"no checkpoint stored for {', '.join(missing)}; run checkpoint(day) first")
+    t0, t1 = date.fromisoformat(start_day), date.fromisoformat(end_day)
+    T = (t1 - t0).days
+    if T <= 0:
+        raise ValueError("end_day must be after start_day")
+    total_f, weighted, rows = 0.0, 0.0, []
+    for f in flows or []:
+        fd, amt = date.fromisoformat(f["day"]), float(f["amount_eur"])
+        if not (t0 <= fd <= t1):
+            raise ValueError(f"flow on {f['day']} is outside {start_day}..{end_day}")
+        w = (T - (fd - t0).days) / T
+        total_f += amt
+        weighted += w * amt
+        rows.append({"day": f["day"], "amount_eur": amt, "weight": round(w, 6)})
+    denom = v0["total_eur"] + weighted
+    r = (v1["total_eur"] - v0["total_eur"] - total_f) / denom
+    return {"start_day": start_day, "end_day": end_day, "days": T, "start_eur": v0["total_eur"],
+            "end_eur": v1["total_eur"], "flows": rows, "flows_total_eur": round(total_f, 2),
+            "gain_eur": round(v1["total_eur"] - v0["total_eur"] - total_f, 2), "return_pct": round(r * 100, 4),
+            "method": "modified dietz, day-weighted flows"}
+
+
+@mcp.tool(annotations=READ_ONLY)
+def dividends(symbol: str, year: int, qty: float | None = None) -> dict:
+    """Cash dividends of one ticker/ISIN in a calendar year, each converted to EUR at the Banca
+    d'Italia rate (the rate Italian tax law uses). Yahoo reports the ex-date, not the payment date,
+    so the ex-date rate is used; for a filing recompute a payment with to_eur(source='bdi',
+    day=pay_date). Amounts are per share, actually paid (split-adjustment undone); pass `qty` to add
+    gross totals for a holding. EUR listings convert at 1."""
+    sym = resolve(symbol)
+    ca = corporate_actions(sym, f"{year}-01-01", f"{year}-12-31")
+    ccy = (ca.get("currency") or "EUR").upper()
+    rows, tot_ccy, tot_eur = [], 0.0, 0.0
+    for d in ca["dividends"]:
+        factor = ca["split_factor_after_end"]
+        for s in ca["splits"]:
+            if s["date"] > d["ex_date"]:
+                factor *= s["ratio"]
+        amt = round(d["amount"] * factor, 6)
+        if ccy == "EUR":
+            rate, rate_date, eur = 1.0, d["ex_date"], amt
+        else:
+            r = bdi.rate(ccy, d["ex_date"])
+            rate, rate_date, eur = r["rate"], r["date"], round(amt / r["rate"], 6)
+        row = {"ex_date": d["ex_date"], "amount": amt, "currency": ccy, "rate": rate, "rate_date": rate_date,
+               "amount_eur": eur}
+        if qty:
+            row["gross"] = round(amt * qty, 2)
+            row["gross_eur"] = round(eur * qty, 2)
+        rows.append(row)
+        tot_ccy += amt
+        tot_eur += eur
+    out = {"symbol": sym, "year": year, "currency": ccy, "payments": rows, "count": len(rows),
+           "total_per_share": round(tot_ccy, 6), "total_per_share_eur": round(tot_eur, 6),
+           "fx_source": "bdi (ex-date)", "note": "ex-dates from Yahoo; payment dates are not available"}
+    if qty:
+        out["qty"] = qty
+        out["gross_total"] = round(tot_ccy * qty, 2)
+        out["gross_total_eur"] = round(tot_eur * qty, 2)
+    return out
 
 
 class BearerAuth(BaseHTTPMiddleware):

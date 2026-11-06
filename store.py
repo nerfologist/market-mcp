@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS closes (
 CREATE TABLE IF NOT EXISTS coverage (
   symbol TEXT PRIMARY KEY, start TEXT NOT NULL, end TEXT NOT NULL
 );
+-- portfolio valuations stored by checkpoint(): one row per day, re-running a day overwrites it
+CREATE TABLE IF NOT EXISTS checkpoints (
+  day TEXT PRIMARY KEY, total_eur REAL NOT NULL, cash_eur REAL, holdings_as_of TEXT,
+  source TEXT NOT NULL, note TEXT, created_at TEXT NOT NULL, detail TEXT
+) WITHOUT ROWID;
+-- alerts.py: one row per threshold currently in the "fired" state (cleared when the price re-arms)
+CREATE TABLE IF NOT EXISTS alert_state (
+  key TEXT PRIMARY KEY, fired_at TEXT NOT NULL, fired_price REAL NOT NULL
+) WITHOUT ROWID;
 """
 
 
@@ -114,3 +123,60 @@ def stats() -> dict:
     size = sum(os.path.getsize(p) for p in (DB_PATH, DB_PATH + "-wal") if os.path.exists(p))
     return {"path": DB_PATH, "size_kb": size // 1024, "quotes_logged": q[0], "quote_symbols": q[1],
             "closes_stored": c[0], "close_symbols": c[1]}
+
+
+def save_checkpoint(day: str, total_eur: float, cash_eur: float | None, holdings_as_of: str | None,
+                    source: str, note: str | None, detail: dict | None) -> None:
+    import json
+    with _lock:
+        _db().execute(
+            "INSERT OR REPLACE INTO checkpoints VALUES (?,?,?,?,?,?,?,?)",
+            (day, total_eur, cash_eur, holdings_as_of, source, note,
+             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), json.dumps(detail) if detail else None),
+        )
+
+
+def get_checkpoint(day: str) -> dict | None:
+    import json
+    with _lock:
+        r = _db().execute(
+            "SELECT day, total_eur, cash_eur, holdings_as_of, source, note, created_at, detail "
+            "FROM checkpoints WHERE day=?", (day,)
+        ).fetchone()
+    if not r:
+        return None
+    return {"day": r[0], "total_eur": r[1], "cash_eur": r[2], "holdings_as_of": r[3], "source": r[4],
+            "note": r[5], "created_at": r[6], "detail": json.loads(r[7]) if r[7] else None}
+
+
+def list_checkpoints() -> list[dict]:
+    with _lock:
+        rows = _db().execute(
+            "SELECT day, total_eur, cash_eur, holdings_as_of, source, note, created_at "
+            "FROM checkpoints ORDER BY day"
+        ).fetchall()
+    return [{"day": r[0], "total_eur": r[1], "cash_eur": r[2], "holdings_as_of": r[3], "source": r[4],
+             "note": r[5], "created_at": r[6]} for r in rows]
+
+
+def delete_checkpoint(day: str) -> bool:
+    with _lock:
+        n = _db().execute("DELETE FROM checkpoints WHERE day=?", (day,)).rowcount
+    return n > 0
+
+
+def alert_states() -> dict[str, dict]:
+    with _lock:
+        rows = _db().execute("SELECT key, fired_at, fired_price FROM alert_state").fetchall()
+    return {k: {"fired_at": a, "fired_price": p} for k, a, p in rows}
+
+
+def alert_fire(key: str, price: float) -> None:
+    with _lock:
+        _db().execute("INSERT OR REPLACE INTO alert_state VALUES (?,?,?)",
+                      (key, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), price))
+
+
+def alert_rearm(key: str) -> None:
+    with _lock:
+        _db().execute("DELETE FROM alert_state WHERE key=?", (key,))

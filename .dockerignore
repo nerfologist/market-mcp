@@ -4,3 +4,4 @@ data/
 deploy.env
 PLAN-*.md
 __pycache__/
+config/

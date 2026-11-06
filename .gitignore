@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 PLAN-*.md
 deploy.env
+config/*.json
+!config/*.example.json

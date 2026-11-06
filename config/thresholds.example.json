@@ -1,0 +1,4 @@
+[
+  {"isin": "US0378331005", "below": 150.0},
+  {"isin": "US0378331005", "above": 250.0, "ref": 171.30, "ref_label": "avg cost"}
+]

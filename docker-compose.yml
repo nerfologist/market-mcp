@@ -16,3 +16,4 @@ services:
       - "8765:8765"
     volumes:
       - ./data:/data   # isins.json (your ISIN map), EODHD call counter, learned ISINs, SQLite cache
+      - ./config:/config:ro   # holdings.json (valued by portfolio/checkpoint), thresholds.json (alerts.py); edited by hand, never by the server

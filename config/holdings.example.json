@@ -1,0 +1,14 @@
+{
+  "as_of": "2026-01-15",
+  "cash_eur": 120.50,
+  "buckets": {
+    "Global core": ["IE00B4L5Y983", "IE00BK5BQT80"],
+    "Single stocks": ["US0378331005", "KYG875721634"]
+  },
+  "positions": [
+    {"isin": "IE00B4L5Y983", "name": "iShares Core MSCI World", "qty": 40, "avg_cost_eur": 95.12},
+    {"isin": "IE00BK5BQT80", "name": "Vanguard FTSE All-World", "qty": 25, "avg_cost_eur": 118.40},
+    {"isin": "US0378331005", "name": "Apple", "qty": 10, "avg_cost_eur": 171.30},
+    {"isin": "KYG875721634", "name": "Tencent", "qty": 100, "avg_cost_eur": 42.80}
+  ]
+}
