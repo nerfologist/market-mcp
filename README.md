@@ -11,7 +11,7 @@ Read-only MCP server with stock prices, FX rates and corporate actions, running 
 
 The server holds no opinions: no targets, no buy or sell logic. It values what the holdings file says.
 
-EUR convention for non-EUR listings: `price_eur` uses the live Yahoo spot (EURUSD, EURHKD, or EURUSD x USDHKD when EURHKD is missing); `previous_close_eur` uses the ECB reference rate of the business day before the quote, so `fx_contribution_pct` is spot-vs-previous-fix. Past closes (`portfolio(day=...)`, `checkpoint`) use the ECB rate of the day; `dividends` uses the Banca d'Italia rate of the ex-date.
+EUR convention for non-EUR listings: `price_eur` uses the live Yahoo spot (EURUSD, EURHKD, or EURUSD x USDHKD when EURHKD is missing); `previous_close_eur` uses the ECB reference rate of the business day before the quote, so `fx_contribution_pct` is spot-vs-previous-fix. Past closes (`portfolio(day=...)`, `checkpoint`) use the ECB rate of the day; `dividends` uses the Banca d'Italia rate of the ex-date, or of the payment date when `pay_dates` are given.
 
 ## Sources
 
@@ -60,7 +60,7 @@ After a trade: edit `config/holdings.json` (qty and avg cost from the broker's b
 docker exec market-mcp python alerts.py
 ```
 
-`ALERT_DRY_RUN=1` prints crossings without storing or sending.
+`ALERT_DRY_RUN=1` prints crossings without storing or sending. `ALERT_HEARTBEAT_URL` (for example a Home Assistant webhook) receives a POST after every successful run, so an automation can notice when the job or the container is down.
 
 ## Test
 

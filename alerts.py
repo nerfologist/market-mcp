@@ -9,6 +9,8 @@ threshold re-arms when the price recrosses the level by REARM_PCT. Never trades.
 Delivery (set in .env): ALERT_NTFY_URL=https://ntfy.sh/<topic> (optional ALERT_NTFY_TOKEN), and/or
 ALERT_HA_WEBHOOK=http://homeassistant:8123/api/webhook/<id> (JSON {"title","message"}). With
 neither set, crossings are printed and the exit code is 2. ALERT_DRY_RUN=1 prints without storing.
+ALERT_HEARTBEAT_URL (e.g. a Home Assistant webhook) is POSTed after every successful run, so a
+"no heartbeat for 2 hours" automation can tell a down container from a quiet market.
 """
 import asyncio
 import json
@@ -26,6 +28,7 @@ TOKEN = os.environ.get("MCP_TOKEN", "").strip()
 NTFY_URL = os.environ.get("ALERT_NTFY_URL", "").strip()
 NTFY_TOKEN = os.environ.get("ALERT_NTFY_TOKEN", "").strip()
 HA_WEBHOOK = os.environ.get("ALERT_HA_WEBHOOK", "").strip()
+HEARTBEAT_URL = os.environ.get("ALERT_HEARTBEAT_URL", "").strip()
 DRY_RUN = os.environ.get("ALERT_DRY_RUN", "") == "1"
 REARM_PCT = float(os.environ.get("ALERT_REARM_PCT", "2"))
 
@@ -122,6 +125,12 @@ def main() -> int:
         print("quote failed:", f, file=sys.stderr)
     if not fired and not rearmed:
         print(f"checked {len(thresholds)} thresholds, nothing crossed")
+    if HEARTBEAT_URL and not failures and not DRY_RUN:
+        try:
+            _post(HEARTBEAT_URL, json.dumps({"checked": len(thresholds), "fired": len(fired)}).encode(),
+                  {"Content-Type": "application/json"})
+        except Exception as e:
+            print("heartbeat failed:", e, file=sys.stderr)
     if fired and not (NTFY_URL or HA_WEBHOOK):
         return 2
     return 1 if failures else 0

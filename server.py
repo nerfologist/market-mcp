@@ -693,7 +693,10 @@ def portfolio(day: str | None = None) -> dict:
     day_change_eur; per bucket value_eur, weight_pct, day_change_eur; totals incl. cash. Without
     `day`: live prices via the quotes_eur convention (Yahoo spot, previous close at the previous ECB
     fix). With `day` (YYYY-MM-DD): closes of that day converted at the ECB reference rate of the day.
-    Warns when the holdings file is older than 7 days. No targets or advice: it values what it is given."""
+    Warns when the holdings file is older than 7 days. A `day` before the last trade silently values
+    TODAY's holdings at that day's prices (the file has no history): for a past total from before the
+    holdings changed, store the broker figure with checkpoint(day, total_eur=...) instead.
+    No targets or advice: it values what it is given."""
     return _value_holdings(_load_holdings(), day)
 
 
@@ -764,12 +767,16 @@ def dietz(start_day: str, end_day: str, flows: list[dict] | None = None) -> dict
 
 
 @mcp.tool(annotations=READ_ONLY)
-def dividends(symbol: str, year: int, qty: float | None = None) -> dict:
+def dividends(symbol: str, year: int, qty: float | None = None,
+              pay_dates: dict[str, str] | None = None) -> dict:
     """Cash dividends of one ticker/ISIN in a calendar year, each converted to EUR at the Banca
-    d'Italia rate (the rate Italian tax law uses). Yahoo reports the ex-date, not the payment date,
-    so the ex-date rate is used; for a filing recompute a payment with to_eur(source='bdi',
-    day=pay_date). Amounts are per share, actually paid (split-adjustment undone); pass `qty` to add
-    gross totals for a holding. EUR listings convert at 1."""
+    d'Italia rate (the rate Italian tax law uses). Yahoo reports the ex-date, not the payment date:
+    by default the ex-date rate is used. For a tax filing the payment date is the taxable event, so
+    pass `pay_dates` = {"<ex_date>": "<pay_date>", ...} from the broker's dividend statement and
+    those payments convert at the pay-date rate (`rate_basis` says which was used per payment).
+    Amounts are per share, actually paid (split-adjustment undone); pass `qty` to add gross totals
+    for a holding. EUR listings convert at 1. The broker statement stays the source of record; this
+    is a cross-check."""
     sym = resolve(symbol)
     ca = corporate_actions(sym, f"{year}-01-01", f"{year}-12-31")
     ccy = (ca.get("currency") or "EUR").upper()
@@ -780,13 +787,17 @@ def dividends(symbol: str, year: int, qty: float | None = None) -> dict:
             if s["date"] > d["ex_date"]:
                 factor *= s["ratio"]
         amt = round(d["amount"] * factor, 6)
+        pay = (pay_dates or {}).get(d["ex_date"])
+        if pay:
+            date.fromisoformat(pay)
+        basis_day = pay or d["ex_date"]
         if ccy == "EUR":
-            rate, rate_date, eur = 1.0, d["ex_date"], amt
+            rate, rate_date, eur = 1.0, basis_day, amt
         else:
-            r = bdi.rate(ccy, d["ex_date"])
+            r = bdi.rate(ccy, basis_day)
             rate, rate_date, eur = r["rate"], r["date"], round(amt / r["rate"], 6)
-        row = {"ex_date": d["ex_date"], "amount": amt, "currency": ccy, "rate": rate, "rate_date": rate_date,
-               "amount_eur": eur}
+        row = {"ex_date": d["ex_date"], "pay_date": pay, "amount": amt, "currency": ccy, "rate": rate,
+               "rate_date": rate_date, "rate_basis": "pay_date" if pay else "ex_date", "amount_eur": eur}
         if qty:
             row["gross"] = round(amt * qty, 2)
             row["gross_eur"] = round(eur * qty, 2)
@@ -795,7 +806,8 @@ def dividends(symbol: str, year: int, qty: float | None = None) -> dict:
         tot_eur += eur
     out = {"symbol": sym, "year": year, "currency": ccy, "payments": rows, "count": len(rows),
            "total_per_share": round(tot_ccy, 6), "total_per_share_eur": round(tot_eur, 6),
-           "fx_source": "bdi (ex-date)", "note": "ex-dates from Yahoo; payment dates are not available"}
+           "fx_source": "bdi", "note": "ex-dates from Yahoo, which has no payment dates; pass pay_dates "
+                                      "from the broker statement to convert at the pay-date rate"}
     if qty:
         out["qty"] = qty
         out["gross_total"] = round(tot_ccy * qty, 2)
