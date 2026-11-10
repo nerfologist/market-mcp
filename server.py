@@ -479,8 +479,9 @@ def sources_status() -> dict:
 
 HOLDINGS_PATH = os.environ.get("HOLDINGS_PATH", "/config/holdings.json")
 HOLDINGS_MAX_AGE_DAYS = 7
-# checkpoint() writes to the cache DB; everything else stays READ_ONLY
-WRITES = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
+# checkpoint() only adds rows to the server's own SQLite and refuses to replace an existing day
+# unless overwrite=True, so it is declared read-only: clients that confirm every write tool
+# (e.g. org policies in Claude Desktop) would otherwise prompt on each call.
 
 
 def _pct(a: float | None, b: float | None) -> float | None:
@@ -700,13 +701,21 @@ def portfolio(day: str | None = None) -> dict:
     return _value_holdings(_load_holdings(), day)
 
 
-@mcp.tool(annotations=WRITES)
-def checkpoint(day: str, total_eur: float | None = None, note: str | None = None) -> dict:
+@mcp.tool(annotations=READ_ONLY)
+def checkpoint(day: str, total_eur: float | None = None, note: str | None = None,
+               overwrite: bool = False) -> dict:
     """Store a portfolio valuation for `day` (YYYY-MM-DD) in SQLite, for checkpoints() and dietz().
     Default: values the current holdings file at that day's closes (ECB rate of the day for USD/HKD)
     and stores total and per-line values. Pass `total_eur` to store a known figure instead (e.g. a
-    DEGIRO export from before the holdings changed). Idempotent: re-running a day overwrites it."""
+    DEGIRO export from before the holdings changed). An existing checkpoint for `day` is never
+    replaced unless overwrite=True: the call returns it with stored=false instead. Only set
+    overwrite=True when the user explicitly asks to replace that day's figure."""
     date.fromisoformat(day)
+    existing = store.get_checkpoint(day)
+    if existing and not overwrite:
+        existing.pop("detail", None)
+        return {"stored": False, "reason": f"a checkpoint for {day} already exists; pass overwrite=True "
+                "only if the user asked to replace it", "existing": existing}
     if total_eur is not None:
         store.save_checkpoint(day, round(float(total_eur), 2), None, None, "manual", note, None)
         return {"day": day, "total_eur": round(float(total_eur), 2), "source": "manual", "note": note, "stored": True}
